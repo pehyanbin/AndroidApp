@@ -9,7 +9,6 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.pdf.PdfDocument
 import android.graphics.Rect
 import android.graphics.RectF
 import android.net.Uri
@@ -93,8 +92,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -143,10 +144,18 @@ data class ExportResult(
     val historyEntry: HistoryEntry
 )
 
-private const val PDF_PAGE_WIDTH = 3840
-private const val PDF_PAGE_HEIGHT = 5430
-private const val PDF_PAGE_MARGIN = 216f
-private const val EXPORT_MAX_IMAGE_DIMENSION = 4096
+private data class PdfImagePage(
+    val pageWidth: Int,
+    val pageHeight: Int,
+    val imageWidth: Int,
+    val imageHeight: Int,
+    val jpegBytes: ByteArray
+)
+
+private data class BitmapBounds(
+    val width: Int,
+    val height: Int
+)
 
 @Composable
 fun Image2PdfApp() {
@@ -912,37 +921,103 @@ private fun exportImagesToSeparatePdfs(context: Context, images: List<EditableIm
 }
 
 private fun writePdf(context: Context, images: List<EditableImage>, output: File) {
-    val pdf = PdfDocument()
-    try {
-        images.forEachIndexed { index, editableImage ->
-            val bitmap = context.createEditedBitmap(editableImage, maxDimension = EXPORT_MAX_IMAGE_DIMENSION) ?: return@forEachIndexed
-            val pageInfo = PdfDocument.PageInfo.Builder(PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT, index + 1).create()
-            val page = pdf.startPage(pageInfo)
-            drawBitmapOnPdfPage(page.canvas, bitmap, editableImage.scale)
-            pdf.finishPage(page)
-            bitmap.recycle()
-        }
-        FileOutputStream(output).use { pdf.writeTo(it) }
-    } finally {
-        pdf.close()
+    val pages = images.map { image -> context.createPdfImagePage(image) }
+    FileOutputStream(output).use { stream ->
+        writeImagePdf(pages, stream)
     }
 }
 
-private fun drawBitmapOnPdfPage(canvas: Canvas, bitmap: Bitmap, scale: Float) {
-    canvas.drawColor(Color.WHITE)
-    val margin = PDF_PAGE_MARGIN
-    val availableWidth = canvas.width - margin * 2
-    val availableHeight = canvas.height - margin * 2
-    val fittedScale = min(availableWidth / bitmap.width, availableHeight / bitmap.height) * scale
-    val drawWidth = bitmap.width * fittedScale
-    val drawHeight = bitmap.height * fittedScale
-    val left = (canvas.width - drawWidth) / 2f
-    val top = (canvas.height - drawHeight) / 2f
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
-    canvas.drawBitmap(bitmap, null, RectF(left, top, left + drawWidth, top + drawHeight), paint)
+private fun Context.createPdfImagePage(image: EditableImage): PdfImagePage {
+    if (!image.hasEdits() && isJpegImage(image.uri)) {
+        val bounds = readBitmapBounds(image.uri)
+            ?: throw IllegalStateException("Could not read ${image.name} dimensions.")
+        val bytes = contentResolver.openInputStream(image.uri)?.use { it.readBytes() }
+            ?: throw IllegalStateException("Could not read ${image.name}.")
+        return PdfImagePage(
+            pageWidth = bounds.width,
+            pageHeight = bounds.height,
+            imageWidth = bounds.width,
+            imageHeight = bounds.height,
+            jpegBytes = bytes
+        )
+    }
+
+    val bitmap = createEditedBitmap(image, maxDimension = null)
+        ?: throw IllegalStateException("Could not decode ${image.name} at original quality.")
+    try {
+        val output = ByteArrayOutputStream()
+        if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 100, output)) {
+            throw IllegalStateException("Could not encode ${image.name} for PDF.")
+        }
+        return PdfImagePage(
+            pageWidth = max(1, (bitmap.width * image.scale).toInt()),
+            pageHeight = max(1, (bitmap.height * image.scale).toInt()),
+            imageWidth = bitmap.width,
+            imageHeight = bitmap.height,
+            jpegBytes = output.toByteArray()
+        )
+    } finally {
+        bitmap.recycle()
+    }
 }
 
-private fun Context.createEditedBitmap(image: EditableImage, maxDimension: Int): Bitmap? {
+private fun writeImagePdf(pages: List<PdfImagePage>, output: OutputStream) {
+    val buffer = ByteArrayOutputStream()
+    val offsets = mutableListOf<Long>()
+
+    fun write(text: String) {
+        buffer.write(text.toByteArray(Charsets.ISO_8859_1))
+    }
+
+    fun startObject(id: Int) {
+        offsets.add(buffer.size().toLong())
+        write("$id 0 obj\n")
+    }
+
+    write("%PDF-1.4\n")
+    val pageTreeObjectId = 2
+    val firstPageObjectId = 3
+    val objectCount = 2 + pages.size * 3
+
+    startObject(1)
+    write("<< /Type /Catalog /Pages $pageTreeObjectId 0 R >>\nendobj\n")
+
+    startObject(pageTreeObjectId)
+    val pageRefs = pages.indices.joinToString(separator = " ") { index ->
+        "${firstPageObjectId + index * 3} 0 R"
+    }
+    write("<< /Type /Pages /Kids [ $pageRefs ] /Count ${pages.size} >>\nendobj\n")
+
+    pages.forEachIndexed { index, page ->
+        val pageObjectId = firstPageObjectId + index * 3
+        val imageObjectId = pageObjectId + 1
+        val contentObjectId = pageObjectId + 2
+        val imageName = "Im${index + 1}"
+
+        startObject(pageObjectId)
+        write("<< /Type /Page /Parent $pageTreeObjectId 0 R /MediaBox [0 0 ${page.pageWidth} ${page.pageHeight}] /Resources << /XObject << /$imageName $imageObjectId 0 R >> >> /Contents $contentObjectId 0 R >>\nendobj\n")
+
+        startObject(imageObjectId)
+        write("<< /Type /XObject /Subtype /Image /Width ${page.imageWidth} /Height ${page.imageHeight} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.jpegBytes.size} >>\nstream\n")
+        buffer.write(page.jpegBytes)
+        write("\nendstream\nendobj\n")
+
+        val content = "q\n${page.pageWidth} 0 0 ${page.pageHeight} 0 0 cm\n/$imageName Do\nQ\n"
+        startObject(contentObjectId)
+        write("<< /Length ${content.toByteArray(Charsets.ISO_8859_1).size} >>\nstream\n$content" + "endstream\nendobj\n")
+    }
+
+    val xrefOffset = buffer.size()
+    write("xref\n0 ${objectCount + 1}\n")
+    write("0000000000 65535 f \n")
+    offsets.forEach { offset ->
+        write(String.format(Locale.US, "%010d 00000 n \n", offset))
+    }
+    write("trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\nstartxref\n$xrefOffset\n%%EOF\n")
+    output.write(buffer.toByteArray())
+}
+
+private fun Context.createEditedBitmap(image: EditableImage, maxDimension: Int?): Bitmap? {
     val source = decodeBitmap(image.uri, maxDimension = maxDimension) ?: return null
     val cropped = cropBitmap(source, image)
     if (cropped !== source) source.recycle()
@@ -955,18 +1030,43 @@ private fun Context.createEditedBitmap(image: EditableImage, maxDimension: Int):
     return drawOverlays(this, sharpened, image)
 }
 
-private fun Context.decodeBitmap(uri: Uri, maxDimension: Int): Bitmap? {
+private fun Context.decodeBitmap(uri: Uri, maxDimension: Int?): Bitmap? {
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
     contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
     val largest = max(bounds.outWidth, bounds.outHeight)
     var sample = 1
-    while (largest / sample > maxDimension) sample *= 2
+    if (maxDimension != null) {
+        while (largest / sample > maxDimension) sample *= 2
+    }
     val options = BitmapFactory.Options().apply {
         inSampleSize = sample
         inPreferredConfig = Bitmap.Config.ARGB_8888
         inScaled = false
     }
-    return contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+    return try {
+        contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+    } catch (error: OutOfMemoryError) {
+        throw IllegalStateException(
+            "This image is too large to process at original quality on this device.",
+            error
+        )
+    }
+}
+
+private fun Context.readBitmapBounds(uri: Uri): BitmapBounds? {
+    val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
+    if (options.outWidth <= 0 || options.outHeight <= 0) return null
+    return BitmapBounds(width = options.outWidth, height = options.outHeight)
+}
+
+private fun Context.isJpegImage(uri: Uri): Boolean {
+    val mimeType = contentResolver.getType(uri)?.lowercase(Locale.US)
+    if (mimeType == "image/jpeg" || mimeType == "image/jpg") return true
+    return displayName(uri).lowercase(Locale.US).let { name ->
+        name.endsWith(".jpg") || name.endsWith(".jpeg")
+    }
 }
 
 private fun cropBitmap(source: Bitmap, image: EditableImage): Bitmap {
