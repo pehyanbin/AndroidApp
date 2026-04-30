@@ -143,6 +143,11 @@ data class ExportResult(
     val historyEntry: HistoryEntry
 )
 
+private const val PDF_PAGE_WIDTH = 3840
+private const val PDF_PAGE_HEIGHT = 5430
+private const val PDF_PAGE_MARGIN = 216f
+private const val EXPORT_MAX_IMAGE_DIMENSION = 4096
+
 @Composable
 fun Image2PdfApp() {
     val context = LocalContext.current
@@ -910,8 +915,8 @@ private fun writePdf(context: Context, images: List<EditableImage>, output: File
     val pdf = PdfDocument()
     try {
         images.forEachIndexed { index, editableImage ->
-            val bitmap = context.createEditedBitmap(editableImage, maxDimension = 2400) ?: return@forEachIndexed
-            val pageInfo = PdfDocument.PageInfo.Builder(595, 842, index + 1).create()
+            val bitmap = context.createEditedBitmap(editableImage, maxDimension = EXPORT_MAX_IMAGE_DIMENSION) ?: return@forEachIndexed
+            val pageInfo = PdfDocument.PageInfo.Builder(PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT, index + 1).create()
             val page = pdf.startPage(pageInfo)
             drawBitmapOnPdfPage(page.canvas, bitmap, editableImage.scale)
             pdf.finishPage(page)
@@ -925,7 +930,7 @@ private fun writePdf(context: Context, images: List<EditableImage>, output: File
 
 private fun drawBitmapOnPdfPage(canvas: Canvas, bitmap: Bitmap, scale: Float) {
     canvas.drawColor(Color.WHITE)
-    val margin = 32f
+    val margin = PDF_PAGE_MARGIN
     val availableWidth = canvas.width - margin * 2
     val availableHeight = canvas.height - margin * 2
     val fittedScale = min(availableWidth / bitmap.width, availableHeight / bitmap.height) * scale
@@ -933,7 +938,8 @@ private fun drawBitmapOnPdfPage(canvas: Canvas, bitmap: Bitmap, scale: Float) {
     val drawHeight = bitmap.height * fittedScale
     val left = (canvas.width - drawWidth) / 2f
     val top = (canvas.height - drawHeight) / 2f
-    canvas.drawBitmap(bitmap, null, RectF(left, top, left + drawWidth, top + drawHeight), Paint(Paint.ANTI_ALIAS_FLAG))
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG)
+    canvas.drawBitmap(bitmap, null, RectF(left, top, left + drawWidth, top + drawHeight), paint)
 }
 
 private fun Context.createEditedBitmap(image: EditableImage, maxDimension: Int): Bitmap? {
@@ -958,6 +964,7 @@ private fun Context.decodeBitmap(uri: Uri, maxDimension: Int): Bitmap? {
     val options = BitmapFactory.Options().apply {
         inSampleSize = sample
         inPreferredConfig = Bitmap.Config.ARGB_8888
+        inScaled = false
     }
     return contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
 }
